@@ -1,0 +1,178 @@
+
+import requests
+from bs4 import BeautifulSoup
+import re
+from urllib.parse import urljoin, urlparse
+from datetime import datetime
+
+MAX_PAGES = 10
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; SimpleCompanyScraper/1.0)"
+}
+
+def fetch_page(url):
+    try:
+        return requests.get(url, headers=HEADERS, timeout=10)
+    except:
+        return None
+
+def extract_emails(text):
+    return list(set(re.findall(
+        r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text)))
+
+def clean_summary(paragraphs):
+    cleaned = []
+    for p in paragraphs:
+        text = p.get_text(strip=True)
+        if len(text) > 60:          # skip short / junk text
+            cleaned.append(text)
+        if len(cleaned) == 3:
+            break
+    return " ".join(cleaned)
+
+def classify_page(url, title):
+    u = url.lower()
+    t = title.lower() if title else ""
+
+    if "career" in u or "job" in t:
+        return "Careers"
+    if "product" in u or "solution" in u:
+        return "Products"
+    if "pricing" in u:
+        return "Pricing"
+    if "contact" in u:
+        return "Contact"
+    if "about" in u:
+        return "About"
+    return "Home"
+
+def is_valid_internal(base_url, link):
+    if link.startswith(("mailto:", "tel:", "#")):
+        return False
+    return urlparse(link).netloc == urlparse(base_url).netloc
+
+def scrape_company(start_url):
+    visited = []
+    queue = [start_url]
+
+    output = {
+        "identity": {
+            "company_name": None,
+            "website_url": start_url,
+            "tagline": None
+        },
+        "business_summary": {
+            "what_they_do": "",
+            "primary_offerings": [],
+            "target_customer_segments": []
+        },
+        "evidence_proof": {
+            "key_pages_detected": [],
+            "signals_found": [],
+            "social_links": {}
+        },
+        "contact_location": {
+            "emails": [],
+            "phones": [],
+            "address": None,
+            "contact_page_url": None
+        },
+        "team_hiring_signals": {
+            "careers_page_url": None,
+            "roles_or_departments_mentioned": []
+        },
+        "metadata": {
+            "timestamp_of_scrape": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "pages_visited": [],
+            "errors_or_fallbacks_used": []
+        }
+    }
+
+    while queue and len(visited) < MAX_PAGES:
+        current = queue.pop(0)
+        if current in visited:
+            continue
+
+        response = fetch_page(current)
+        if not response or response.status_code != 200:
+            output["metadata"]["errors_or_fallbacks_used"].append(
+                f"Failed to load {current}")
+            continue
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        visited.append(current)
+        output["metadata"]["pages_visited"].append(current)
+
+        page_text = soup.get_text(" ", strip=True)
+
+        # ---- Identity ----
+        if not output["identity"]["company_name"] and soup.title:
+            output["identity"]["company_name"] = soup.title.text.strip()
+
+        # ---- Business Summary (homepage only) ----
+        if current == start_url:
+            paragraphs = soup.find_all("p")
+            summary = clean_summary(paragraphs)
+            if summary:
+                output["business_summary"]["what_they_do"] = summary
+            else:
+                output["metadata"]["errors_or_fallbacks_used"].append(
+                    "No meaningful business summary found")
+
+        # ---- Emails ----
+        output["contact_location"]["emails"].extend(
+            extract_emails(page_text))
+
+        # ---- Social Links ----
+        for a in soup.find_all("a", href=True):
+            link = a["href"]
+            if "linkedin.com" in link:
+                output["evidence_proof"]["social_links"]["linkedin"] = link
+            elif "twitter.com" in link or "x.com" in link:
+                output["evidence_proof"]["social_links"]["twitter"] = link
+            elif "youtube.com" in link:
+                output["evidence_proof"]["social_links"]["youtube"] = link
+            elif "instagram.com" in link:
+                output["evidence_proof"]["social_links"]["instagram"] = link
+
+        # ---- Page Detection ----
+        title = soup.title.text if soup.title else ""
+        page_type = classify_page(current, title)
+        if page_type not in output["evidence_proof"]["key_pages_detected"]:
+            output["evidence_proof"]["key_pages_detected"].append(page_type)
+
+        # ---- Careers & Contact ----
+        if page_type == "Careers":
+            output["team_hiring_signals"]["careers_page_url"] = current
+            output["evidence_proof"]["signals_found"].append(
+                "Careers page detected")
+
+        if page_type == "Contact":
+            output["contact_location"]["contact_page_url"] = current
+
+        # ---- Discover Internal Links ----
+        for a in soup.find_all("a", href=True):
+            full_url = urljoin(start_url, a["href"])
+            if is_valid_internal(start_url, full_url):
+                if full_url not in visited and full_url not in queue:
+                    queue.append(full_url)
+
+    # ---- Cleanup ----
+    output["contact_location"]["emails"] = list(
+        set(output["contact_location"]["emails"]))
+
+    if not output["contact_location"]["emails"]:
+        output["metadata"]["errors_or_fallbacks_used"].append(
+            "No public email found")
+
+    return output
+
+
+# -------- MAIN --------
+print("Input: URL()")
+website = input("Enter company website URL: ")
+
+import json
+print("\n--- OUTPUT ---")
+print(json.dumps(scrape_company(website), indent=2))
